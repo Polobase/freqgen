@@ -231,8 +231,8 @@ describe("GenXPro.loadPreset", () => {
     // real capture; here slot 1 / wf 41, same encoding). Offset stays at
     // centre 120 even though the preset sets Out1_Offset=100 — Spooky2 applies
     // offsets at run time, not in the stored program.
-    assert.equal(writes[2], ":p01=41,2000,120,2700,1,183586,");
-    assert.equal(writes[3], ":g01=0,0,");
+    assert.equal(writes[3], ":p01=41,2000,120,2700,1,183586,");
+    assert.equal(writes[2], ":g01=0,0,");
   });
 
   it("maps the preset's Out1_Amplitude setting to the amplitude field", async () => {
