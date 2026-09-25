@@ -47,7 +47,13 @@ Two of these directly confirm decisions in the driver:
 | Out 2 modulation on/off | 13 | vendor label | ✅ `setModulation` |
 | Out 2 sync | 14 | vendor label | ✅ `setSync` |
 | Low-frequency mode | 15 (two fields) | **confirmed by capture** (`:w15=<a>,<b>,`; 51 never sent) | ✅ `setLowFrequencyMode` |
-| Calibration | 50 / 71 | vendor label | ✅ `calibrate` |
+| Gate times (per output) | 50 / 51 | **confirmed from the display firmware** (`runner.c:60-66`: `:w50=aaaaa,bbbbb,` before `:w12=1,1,`) | ✅ `setGateTimes` |
+| Calibration | — | a vendor debug string calls 50 "Calibrate no load", but the firmware uses 50/51 as gate times and never uses 71 | ❌ withdrawn |
+| Program/name readback | `:n<NN>=?` / `*` / `#` | **confirmed from the display firmware** (`link.c:476-526`) | ✅ `readProgramName` / `readProgram` / `readGateTable` |
+| Display revision | `:n00=$` → `:Rev201` | **confirmed** (`link.c:549-551`); ungated, Spooky2 sends it on connect | ✅ `readDisplayRevision` |
+| Erase one slot / all slots | `:n<NN>=,` / `:w96=12321,` | **confirmed** (`link.c:552-556`, `634-639`); `w96` erases slots 1–30 + names, once per power cycle | ✅ `eraseProgram` / `eraseAllPrograms` |
+| Backlight | 64 | **confirmed** (`link.c:606-611`), not gated by auth | ✅ `setBacklight` |
+| PC display-state reset | 97 | **confirmed** (`link.c:640-651`) | ✅ `resetPcDisplayState` |
 | Reset | 95 | vendor label | ✅ `reset` |
 | Authentication | 90 / 92 | **confirmed on hardware** | ✅ bundled provider |
 | Biofeedback read (current, angle) | r11 / r12 | **confirmed reading live values** | ✅ `readBiofeedback` (raw counts) |
@@ -69,11 +75,16 @@ Ranked by value against how reachable each is without an oscilloscope.
   are exposed by `readBiofeedback()` (raw counts, confirmed live on hardware),
   and `biofeedbackScan()` performs the scan.
 - **Raw-count → amps/degrees calibration.** The spec gives 3.4 µA and 0.0015°
-  resolution. The capture's analysis export shows Spooky2's displayed
-  biofeedback value ≈ `r11 / 100` (raw `r11 ≈ 45300` → "Data" ≈ 453), and its
-  scan flags a "hit" when that value deviates from a running average — a simple
-  resonance detector. Absolute amps still need a reference meter, but the
-  `/100` scaling and the running-average/hit logic are now known.
+  resolution. Spooky2 displays and exports **exactly `r11 / 100` and
+  `r12 / 100`**. Its BFB CSV rows are `(loop − baseline) / 100`, confirmed row
+  for row against the capture (2026-08-21), and its display showed `:r11=46210.`
+  / `:r12=5784.` as 462.10 / 57.84 (2026-09-21). Its scan flags a "hit" when the
+  value deviates from a running average — a simple resonance detector. The
+  library uses the `/100` scale by default. Absolute amps still need a
+  reference meter. With nothing connected, the detector still reads about 462 /
+  57.8°, flat across frequency (±0.02 over a 3 % sweep, where capacitive current
+  would rise by ~15). That no-load reading is a fixed baseline; a load (a
+  Sample Digitizer: +27 / +17°) adds to it.
 - **Offset scale confirmation.** Frequency is display-verified and amplitude is
   capture-confirmed (peak centivolts, `vpp × 50`); the offset span is now
   **confirmed ±100** by the capture (`:w32=20,` ⇔ Offset −100, `:w33=220,` ⇔

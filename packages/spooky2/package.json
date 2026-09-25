@@ -1,6 +1,6 @@
 {
   "name": "@freqgen/spooky2",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript drivers for Spooky2 signal generators \u2014 XM, Gen X and Gen X Pro \u2014 over USB serial, in Node.js and the browser.",
   "type": "module",
   "sideEffects": false,
@@ -23,6 +23,7 @@
     "dist",
     "src",
     "README.md",
+    "CHANGELOG.md",
     "docs"
   ],
   "repository": {
