@@ -33,6 +33,27 @@ describe("parseCliArgs", () => {
   it("rejects an unknown command", () => {
     assert.throws(() => parseCliArgs(["frobnicate"]), /Unknown command/);
   });
+
+  it("parses a conformance run that records a baseline", () => {
+    const { command, values } = parseCliArgs([
+      "conformance",
+      "--port",
+      "/dev/cu.usbserial-1",
+      "--record",
+      "original.json",
+      "--slot",
+      "29",
+    ]);
+    assert.equal(command, "conformance");
+    assert.equal(values["port"], "/dev/cu.usbserial-1");
+    assert.equal(values["record"], "original.json");
+    assert.equal(values["slot"], "29");
+  });
+
+  it("parses a conformance run that compares against one", () => {
+    const { values } = parseCliArgs(["conformance", "-p", "/dev/x", "--compare", "original.json"]);
+    assert.equal(values["compare"], "original.json");
+  });
 });
 
 describe("SPOOKY2_DEVICES", () => {

@@ -49,6 +49,81 @@ npx @freqgen/spooky2 set --device xm --port /dev/cu.usbserial-1120 \
     --waveform square --freq 727.5 --amp 20 --on
 ```
 
+## Comparing two firmwares on a Gen X Pro
+
+The display board's behaviour has been recovered from its firmware
+([open-spooky2](https://github.com/Polobase/open-spooky2)), so a unit can be
+checked against it — which is what you want when you flash your own build and
+need to know what changed:
+
+```bash
+# on the original firmware
+npx @freqgen/spooky2 conformance --port /dev/cu.usbserial-X --record original.json
+# flash your build, then
+npx @freqgen/spooky2 conformance --port /dev/cu.usbserial-X --compare original.json
+```
+
+Each case asserts what the spec says *and* records the exact reply, so the diff
+catches both spec violations and undocumented behaviour your build dropped.
+
+Point it at your `.dmslog8` captures and it adds a third opinion — what the
+vendor software actually got out of a real unit:
+
+```bash
+npx @freqgen/spooky2 conformance --port /dev/cu.usbserial-X --captures ./local
+# Expectations from 8 capture(s) in ./local: 29 commands the real device answered.
+#   ✔ reg-frequency   Out 1 / Out 2 frequency (:w24=/:w25=)  ⟦capture ✔⟧
+```
+
+A capture settles what no document can: `:w13=0,` is acknowledged, `:n00=$`
+answers with a revision, every live register write is met with `:ok`. The check
+compares the *kind* of answer — acknowledged, rejected, silent or data — not the
+data itself, which belongs to the unit the capture came from. Cases with no
+vendor counterpart (an out-of-range slot, a line built to be dropped) are not
+compared. Reading ~100 MB of captures takes about 20 seconds; point `--captures`
+at one capture folder to keep it quick.
+Groups (`--groups`): `link`, `registers`, `programs`, `parser`, `handshake`,
+`calibration`, `biofeedback`, `display`.
+
+It covers every command in open-spooky2's `docs/serial-commands.md` except the
+ones that would damage or disturb the unit, which it never sends:
+
+| Not sent | Why |
+| --- | --- |
+| `:w96=12321,` | erases all 30 programs and every name |
+| `:w95=12021,` | reboots the display MCU |
+| `:w00=` | writes the bootloader flash page on the original firmware |
+| `:w91=` | the vendor's session handshake — the driver already runs it |
+| `:w60` `:w61` `:w62` `:w63` `:w80` | calibration **writes**; the read `:r80=0,` is included |
+
+No output is ever enabled and amplitude is only ever written as 0, so a scope
+stays quiet. It borrows one program slot (`--slot`, default 30), dumping its
+contents first and restoring them afterwards. The visible cases run last: the
+PC-mode title is set and put back, a frequency is left on screen, and the
+backlight blinks off and on — so you can see the run finish on the device.
+
+A display-handled `:w` frame (`:w64`, `:w97`) is processed in the device's main
+loop, and while one is pending the link **discards every byte that arrives**
+(`src/link.c:284`). Anything sent straight after one is lost, so the suite
+leaves a gap between them — without it, a backlight restore goes missing and
+the screen stays dark.
+
+## Reading the device back
+
+Program memory is readable, so you can verify what is actually stored:
+
+```ts
+await pro.readDisplayRevision();   // "Rev201"  (:n00=$)
+await pro.readProgramName(7);      // ":n07=?"
+await pro.readProgram(7);          // ":n07=*" → the same shape uploadProgram takes
+await pro.readGateTable(7);        // ":n07=#" — 200 of the 400 stored values
+await pro.eraseProgram(7);         // ":n07=,"
+await pro.eraseAllPrograms();      // ":w96=12321," — wipes slots 1–30 AND every name
+```
+
+`eraseAllPrograms()` is destructive and the device honours it only once per
+power cycle. Spooky2 sends it *before* rewriting the whole slot set.
+
 ## Devices
 
 | Driver | Device | Protocol | Notes |
@@ -127,9 +202,32 @@ The Gen X Pro's high-side detector reads output current and phase angle, live:
 const { current, phaseAngle } = await pro.readBiofeedback(); // raw detector counts
 ```
 
-Confirmed reading live values on hardware. The raw counts are directly usable for
-a biofeedback *scan* (sweep frequency, find where the response peaks); the
-absolute conversion to amps/degrees is not yet calibrated.
+Confirmed reading live values on hardware. Spooky2 shows both as **count / 100**
+(`:r11=46210.` → Current 462.10), and `convertBiofeedback()` / `toBfbCsv()` use
+that scale by default, so their values match Spooky2's display and BFB CSV. The
+absolute conversion to amps/degrees is not calibrated. An unloaded Gen X Pro
+still reads about 462 / 57.8° — a fixed baseline. A load only adds to it, so
+biofeedback works on changes from a baseline, never the absolute number.
+
+`biofeedbackScan()` reproduces Spooky2's biofeedback scan. The settings below are
+Spooky2's "General Biofeedback Scan (SD)", checked against a serial capture of
+it. Each step and each settle reading goes out on the wire exactly as Spooky2
+sends it:
+
+```ts
+const samples = await pro.biofeedbackScan({
+  startHz: 41_000, endHz: 1_800_000,
+  stepPercent: 0.025,   // BFB_Initial_Step_Size_% — 41000 × 1.00025^k
+  startDelay: 200,      // BFB_Start_Delay — settle readings, discarded
+  loops: 2, baseline: true, dwellMs: 70,
+  amplitudeVpp: 40,     // :w28=2000, — what Spooky2 wrote for "20v"
+});
+const hits = detectHits(samples.map((s) => ({ hz: s.hz, value: s.current })));
+```
+
+Like Spooky2, it drives both outputs: Out 2 follows Out 1's frequency in
+hardware, inverted, at the same amplitude. Pass `bothOutputs: false` to drive
+only `channel`.
 
 ## Running a program
 

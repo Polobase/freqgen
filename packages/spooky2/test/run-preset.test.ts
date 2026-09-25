@@ -125,7 +125,7 @@ describe("runPresetRun", () => {
     assert.ok(writes.includes(":w20=11,"));
     assert.ok(writes.includes(":w28=1000,"));
     assert.ok(writes.includes(":w32=20,"));
-    assert.ok(writes.includes(":w11=1,0,"));
+    assert.ok(writes.includes(":w11=1,,"));
 
     // amplitude and offset written once, not per step
     assert.equal(writes.filter((w) => w.startsWith(":w28=")).length, 1);
@@ -141,7 +141,7 @@ describe("runPresetRun", () => {
     assert.equal(freqs.length, 171);
 
     // output off at the end
-    assert.equal(writes.at(-1), ":w11=0,0,");
+    assert.equal(writes.at(-1), ":w11=0,,");
   });
 
   it("drives both channels with their own offset, ending output off", async () => {

@@ -54,16 +54,45 @@ describe("detectHits", () => {
 });
 
 describe("convertBiofeedback / toBfbCsv", () => {
+  it("defaults to Spooky2's display scale: raw counts / 100", () => {
+    // 2026-09-21 capture, Gen X Pro with no load: the device answered
+    // `:r11=46210.` / `:r12=5784.` and Spooky2 displayed 462.10 / 57.84.
+    const { currentMa, angleDeg } = convertBiofeedback(46210, 5784);
+    assert.equal(Math.round(currentMa * 100) / 100, 462.1);
+    assert.equal(Math.round(angleDeg * 100) / 100, 57.84);
+  });
+
   it("converts raw counts using the device-spec scale and a baseline", () => {
+    const spec = { currentUaPerCount: 3.4, angleDegPerCount: 0.0015 };
     // 42448 counts, 3.4 µA/count, baseline 42448 → 0 mA.
-    assert.equal(convertBiofeedback(42448, 0, { currentBaseline: 42448 }).currentMa, 0);
+    assert.equal(convertBiofeedback(42448, 0, { ...spec, currentBaseline: 42448 }).currentMa, 0);
     // 50 counts above baseline → 50 × 3.4 µA = 0.17 mA.
     assert.equal(
-      Math.round(convertBiofeedback(42498, 0, { currentBaseline: 42448 }).currentMa * 1000) / 1000,
+      Math.round(convertBiofeedback(42498, 0, { ...spec, currentBaseline: 42448 }).currentMa * 1000) / 1000,
       0.17,
     );
     // 0.0015°/count.
-    assert.equal(convertBiofeedback(0, 5208, { angleBaseline: 5208 }).angleDeg, 0);
+    assert.equal(convertBiofeedback(0, 5208, { ...spec, angleBaseline: 5208 }).angleDeg, 0);
+  });
+
+  it("reproduces the values of Spooky2's own BFB CSV by default", () => {
+    // 2026-08-21 capture (scan1): raw loop-1 reading minus the baseline sweep,
+    // and the rows Spooky2 wrote for them to BFB_20260821_1410_35.csv.
+    const samples = [
+      { hz: 1, current: 42433 - 42460, phaseAngle: 6649 - 5398 },
+      { hz: 1.25, current: 42473 - 42436, phaseAngle: 5911 - 5290 },
+      { hz: 1.5, current: 42463 - 42407, phaseAngle: 5519 - 5703 },
+    ];
+    const spooky2 = [
+      [12.51, -0.27, 12.24],
+      [6.21, 0.37, 6.58],
+      [-1.84, 0.56, -1.28],
+    ];
+    const rows = toBfbCsv(samples, { dateTime: "20260821_1411_32" }).trim().split("\n").slice(1);
+    assert.deepEqual(
+      rows.map((r) => r.split(",").slice(4, 7).map(Number)),
+      spooky2,
+    );
   });
 
   it("renders Spooky2's BFB CSV column layout", () => {

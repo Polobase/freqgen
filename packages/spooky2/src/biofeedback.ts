@@ -90,19 +90,27 @@ export function detectHits(
 }
 
 /**
- * Raw-to-engineering-unit calibration for the biofeedback detector.
+ * Raw-to-display-unit scale for the biofeedback detector.
  *
  * The detector returns 16-bit raw counts for current (`:r11`) and phase angle
- * (`:r12`). The device spec quotes 3.4 µA and 0.0015° per count, but the scan
- * values Spooky2 writes are *deltas* from a baseline that depends on the
- * sample, amplitude and wiring — so the baseline must be calibrated on the
- * hardware you are driving. Pass the same calibration to `toBfbCsv` and the
- * values match Spooky2's own CSV.
+ * (`:r12`). Spooky2 shows and exports both as **count / 100** — confirmed by
+ * capture: `:r11=46210.` / `:r12=5784.` displayed as 462.10 / 57.84, and its
+ * BFB CSV rows equal (loop − baseline) / 100 exactly. That is the default here,
+ * so `toBfbCsv` reproduces Spooky2's CSV values. Spooky2 labels neither
+ * number, so whether they are really mA and degrees is unverified.
+ *
+ * The device spec quotes 3.4 µA and 0.0015° per count instead; pass
+ * `{ currentUaPerCount: 3.4, angleDegPerCount: 0.0015 }` for that scale.
+ *
+ * The scan values Spooky2 writes are *deltas* from a baseline that depends on
+ * the sample, amplitude and wiring (with nothing connected, a Gen X Pro still
+ * reads ≈ 462 / 57.8°), so the baseline must be measured on the hardware you
+ * are driving.
  */
 export interface BiofeedbackCalibration {
-  /** Microamps per raw current count. Default: 3.4 (device spec). */
+  /** Microamps per raw current count. Default: 10 (Spooky2's count / 100). */
   currentUaPerCount?: number;
-  /** Degrees per raw phase-angle count. Default: 0.0015 (device spec). */
+  /** Degrees per raw phase-angle count. Default: 0.01 (Spooky2's count / 100). */
   angleDegPerCount?: number;
   /** Raw current count that reads as 0 mA (the sample's resting current). */
   currentBaseline?: number;
@@ -122,8 +130,8 @@ export function convertBiofeedback(
   phaseAngle: number | null,
   calibration: BiofeedbackCalibration = {},
 ): CalibratedBiofeedback {
-  const uaPerCount = calibration.currentUaPerCount ?? 3.4;
-  const degPerCount = calibration.angleDegPerCount ?? 0.0015;
+  const uaPerCount = calibration.currentUaPerCount ?? 10;
+  const degPerCount = calibration.angleDegPerCount ?? 0.01;
   const currentBaseline = calibration.currentBaseline ?? 0;
   const angleBaseline = calibration.angleBaseline ?? 0;
   return {

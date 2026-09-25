@@ -149,8 +149,11 @@ Waveform slots seen uploaded: 11–21, 24, 25, 45–47. `:w20=<slot>` / `:w21=<s
 then select a slot for live output (11 = sine, 12 = square, 13 = rising ramp).
 
 The biofeedback scan is a host-side loop — `:w24=<freq>` then `:r11=` (current)
-and `:r12=` (phase), swept across a range; Spooky2's displayed value ≈ `r11/100`,
-and it flags a "hit" where that deviates from a running average. A second capture
+and `:r12=` (phase), swept across a range; Spooky2's displayed value is exactly
+`r11/100` (and `r12/100`), and it flags a "hit" where that deviates from a running
+average. A percentage step multiplies the frequency each step (0.025 % from 41 kHz
+→ `41000 × 1.00025^k`), and `BFB_Start_Delay=200` shows up as 202 reads at the
+start frequency (201 discarded, one kept) in every pass. A second capture
 (2026-08-15, "save to device" + running a preset) shows a **plain frequency
 sweep** with no biofeedback reads: sequential `:w24=<freq>,` writes, linear in Hz
 within each segment (~0.18 Hz/step at 3.44 Hz, ~3.9 Hz/step at 72 Hz), ~82–84

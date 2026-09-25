@@ -56,6 +56,7 @@ import { GENX_AUTH_PROVIDER } from "./genx-auth-transform.js";
 import {
   channelSlot,
   encodeGenXFrequency,
+  decodeGenXFrequency,
   outField,
   amplitudeRegisterValue,
 } from "./genx-wire.js";
@@ -108,14 +109,31 @@ export const GENX_PRO_REGISTERS = {
   offsetOut2: 33,
   /** Out 2 phase angle. Out 1 has no phase register. */
   phaseOut2: 40,
-  /** Calibrate, no load. */
-  calibrateNoLoad: 50,
-  /** Calibrate, 50 Ω load. */
-  calibrate50Ohm: 71,
+  /**
+   * Out 1 gate times — a zero-padded `<on>,<off>,` pair, enabled by {@link gating}.
+   *
+   * The display firmware's program runner sends `:w50=aaaaa,bbbbb,` then
+   * `:w51=…` and only then `:w12=1,1,` (open-spooky2 `src/runner.c:60-66`), so
+   * these carry the per-step gate pair. A vendor debug string in Spooky2 calls
+   * register 50 "Calibrate no load"; the firmware never uses it that way, and
+   * register 71 does not appear in the firmware at all.
+   */
+  gateTimesOut1: 50,
+  /** Out 2 gate times, same `<on>,<off>,` form as {@link gateTimesOut1}. */
+  gateTimesOut2: 51,
   /** Device reset — written as `:w95=12021,`. */
   reset: 95,
-  /** Commit — written as `:w96=12321,`; seen right after writing generator memory. */
-  commit: 96,
+  /**
+   * **Erase all programs** — `:w96=12321,` wipes program slots 1–30 and every
+   * name (open-spooky2 `src/link.c:634-639`), and the firmware honours it only
+   * once per power cycle. It is not a commit: Spooky2 sends it *before*
+   * uploading, under the display text "Erasing".
+   */
+  eraseAll: 96,
+  /** Backlight — `:w64=18888881,` on, `:w64=10000001,` off. Not gated by auth. */
+  backlight: 64,
+  /** Reset the PC-mode display state of this link — `:w97=12621,`. */
+  pcDisplayReset: 97,
   authChallenge: 90,
   authResponse: 92,
 } as const;
@@ -304,8 +322,14 @@ export class GenXPro implements SignalGenerator {
         const ack = await this.command(
           `:w${GENX_PRO_REGISTERS.authResponse}=${response}.`,
         );
-        if (/:?ok/i.test(ack)) ok = true;
-        else this.log(`auth round ${round} attempt ${attempt}: ${JSON.stringify(ack)}`);
+        if (/:?ok/i.test(ack)) {
+          ok = true;
+          // The display board answers `:w92` with a `:w91=0,` of its own, about
+          // 20 ms later on the same line (open-spooky2 `src/link.c:624-629`).
+          // Drop it here, or it becomes the reply to the next command and every
+          // reply after that is one out of step.
+          await this.resync();
+        } else this.log(`auth round ${round} attempt ${attempt}: ${JSON.stringify(ack)}`);
       }
       if (!ok) {
         this.authenticated = false;
@@ -463,9 +487,11 @@ export class GenXPro implements SignalGenerator {
   async setOutput(channel: number, enabled: boolean): Promise<void> {
     assertChannel(channel);
     this.outputOn[channel] = enabled;
-    // Register 11 carries both outputs; send the current pair.
+    // Register 11 carries both outputs, but an empty field means "leave
+    // unchanged" (open-spooky2 `src/link.c:116-127`), so addressing one output
+    // no longer switches the other off. This is the form Spooky2 itself sends.
     await this.command(
-      `:w${GENX_PRO_REGISTERS.output}=${this.outputOn[0] ? 1 : 0},${this.outputOn[1] ? 1 : 0},`,
+      `:w${GENX_PRO_REGISTERS.output}=${channelSlot(channel, enabled ? 1 : 0)}`,
     );
   }
 
@@ -534,9 +560,16 @@ export class GenXPro implements SignalGenerator {
   }
 
   /** Run the calibration routine. `load: "50ohm"` uses register 71, else 50. */
-  async calibrate(load: "none" | "50ohm" = "none"): Promise<void> {
-    const reg = load === "50ohm" ? GENX_PRO_REGISTERS.calibrate50Ohm : GENX_PRO_REGISTERS.calibrateNoLoad;
-    await this.writeOut(reg, 1);
+  async setGateTimes(channel: number, on: number, off: number): Promise<void> {
+    assertChannel(channel);
+    for (const [name, v] of [["on", on], ["off", off]] as const) {
+      if (!Number.isInteger(v) || v < 0 || v > 0xffff) {
+        throw new AwgError(`gate ${name} time must be an integer 0…65535, got ${v}`);
+      }
+    }
+    const reg = channel === 0 ? GENX_PRO_REGISTERS.gateTimesOut1 : GENX_PRO_REGISTERS.gateTimesOut2;
+    const pad = (v: number) => String(v).padStart(5, "0");
+    await this.command(`:w${reg}=${pad(on)},${pad(off)},`);
   }
 
   /** Reset the device (`:w95=12021,`). */
@@ -546,13 +579,16 @@ export class GenXPro implements SignalGenerator {
   }
 
   /**
-   * Commit written generator memory (`:w96=12321,`).
+   * **Erase every offline program** (`:w96=12321,`) — slots 1–30 and all names.
    *
-   * Spooky2 sends this after writing an offline program to memory; it appears to
-   * finalise the write. {@link uploadProgram} calls it automatically.
+   * The display firmware wipes the program sectors and the name sector, and
+   * accepts this only once per power cycle (`src/link.c:634-639`). Spooky2
+   * sends it before re-writing the whole slot set, not after a write: an
+   * earlier version of this driver called it a "commit" and sent it at the end
+   * of {@link uploadProgram}, which erased the program it had just stored.
    */
-  async commitOfflineMemory(): Promise<void> {
-    await this.writeOut(GENX_PRO_REGISTERS.commit, 12321);
+  async eraseAllPrograms(): Promise<void> {
+    await this.writeOut(GENX_PRO_REGISTERS.eraseAll, 12321);
   }
 
   /** Turn both outputs off. */
@@ -630,22 +666,50 @@ export class GenXPro implements SignalGenerator {
    * The output is driven during the scan (a scan with no output reads only
    * noise). Returns one sample per step; the caller finds the resonance by
    * looking for where `current` peaks or `phaseAngle` turns.
+   *
+   * To reproduce a Spooky2 biofeedback preset, map its fields:
+   * `BFB_Initial_Step_Size_%` → `stepPercent` (or `_Hz` → `stepHz`),
+   * `BFB_Start_Delay` → `startDelay`, `BFB_Loops` → `loops`,
+   * `Baseline_Before_BFB` → `baseline`, Min Read Delay → `dwellMs`.
    */
   async biofeedbackScan(options: {
     /** Range start in Hz. */
     startHz: number;
     /** Range end in Hz (may be below start — the sweep goes either direction). */
     endHz: number;
-    /** Number of steps across the range. Mutually exclusive with `stepHz`. */
+    /** Number of steps across the range. Mutually exclusive with the step sizes. */
     steps?: number;
-    /** Step size in Hz. Mutually exclusive with `steps`. */
+    /** Step size in Hz. Mutually exclusive with `steps` and `stepPercent`. */
     stepHz?: number;
+    /**
+     * Step size as a percentage of the current frequency — Spooky2's
+     * `BFB_Initial_Step_Size_%`. Each step multiplies the frequency by
+     * `1 + stepPercent / 100` (confirmed by capture: 0.025 % from 41 kHz gives
+     * exactly 41000 × 1.00025^k), stopping at the last step inside the range.
+     */
+    stepPercent?: number;
     /** Channel to drive. Default 0. */
     channel?: number;
+    /**
+     * Drive Out 2 alongside Out 1, as Spooky2's biofeedback presets do
+     * (`Out2_Follow_Out1_Frequency`, `InverseWave`): Out 2 is synced to Out 1's
+     * frequency in hardware, inverted, and given the same amplitude. Sync and
+     * inversion stay set after the scan. Default: true when scanning channel 0.
+     * Hardware sync only runs Out 1 → Out 2, so it cannot be used with channel 1.
+     */
+    bothOutputs?: boolean;
     /** Drive amplitude for the scan. Default: leave the current amplitude. */
     amplitudeVpp?: number;
     /** Settle time before reading, per step, in ms. Default 0. */
     dwellMs?: number;
+    /**
+     * Readings to take and discard at the start frequency before each pass, so
+     * the reading settles — Spooky2's `BFB_Start_Delay`. Like Spooky2, a
+     * setting of `n` discards `n + 1` readings (200 → 201, then the kept one:
+     * 202 reads at the start frequency in every pass of two captures).
+     * Default 0 (none).
+     */
+    startDelay?: number;
     /** Number of passes to average (Spooky2's `BFB_Loops`). Default 1. */
     loops?: number;
     /**
@@ -655,7 +719,7 @@ export class GenXPro implements SignalGenerator {
      * for {@link detectHits}.
      */
     baseline?: boolean;
-    /** Turn the output off when the scan ends. Default true. */
+    /** Turn the output(s) off when the scan ends. Default true. */
     stopOutputAtEnd?: boolean;
     /** Cancel the scan. */
     signal?: AbortSignal;
@@ -667,40 +731,66 @@ export class GenXPro implements SignalGenerator {
     if (!Number.isFinite(options.startHz) || !Number.isFinite(options.endHz)) {
       throw new AwgError("biofeedbackScan needs finite startHz and endHz");
     }
-    const span = options.endHz - options.startHz;
-    const steps =
-      options.steps ??
-      (options.stepHz ? Math.max(1, Math.round(Math.abs(span) / options.stepHz)) : 100);
-    if (steps < 1) throw new AwgError("biofeedbackScan needs at least one step");
-    const loops = Math.max(1, Math.round(options.loops ?? 1));
-
-    if (options.amplitudeVpp !== undefined) {
-      await this.setAmplitude(channel, options.amplitudeVpp);
+    let grid: number[];
+    if (options.stepPercent !== undefined) {
+      if (options.steps !== undefined || options.stepHz !== undefined) {
+        throw new AwgError("biofeedbackScan takes stepPercent on its own, not with steps or stepHz");
+      }
+      grid = percentGrid(options.startHz, options.endHz, options.stepPercent);
+    } else {
+      const span = options.endHz - options.startHz;
+      const steps =
+        options.steps ??
+        (options.stepHz ? Math.max(1, Math.round(Math.abs(span) / options.stepHz)) : 100);
+      if (steps < 1) throw new AwgError("biofeedbackScan needs at least one step");
+      grid = Array.from({ length: steps + 1 }, (_, i) => options.startHz + (span * i) / steps);
     }
-    await this.setOutput(channel, true);
+    const both = options.bothOutputs ?? channel === 0;
+    if (both && channel !== 0) {
+      throw new AwgError("bothOutputs needs channel 0 — hardware sync runs Out 1 → Out 2 only");
+    }
+    const driven = both ? [0, 1] : [channel];
+    const loops = Math.max(1, Math.round(options.loops ?? 1));
+    const startDelay = Math.max(0, Math.round(options.startDelay ?? 0));
+    const settleReads = startDelay > 0 ? startDelay + 1 : 0;
 
+    if (both) {
+      await this.setSync(true);
+      await this.setInversion(1, true);
+    }
+    if (options.amplitudeVpp !== undefined) {
+      for (const ch of driven) await this.setAmplitude(ch, options.amplitudeVpp);
+    }
+    for (const ch of driven) await this.setOutput(ch, true);
+
+    const dwell = async () => {
+      if (options.dwellMs) await new Promise((r) => setTimeout(r, options.dwellMs));
+    };
     // One full sweep, returning the raw detector reading at each step (partial on abort).
     const sweep = async (): Promise<Array<{ current: number; phaseAngle: number }>> => {
       const out: Array<{ current: number; phaseAngle: number }> = [];
-      for (let i = 0; i <= steps; i++) {
+      for (let i = 0; i < grid.length; i++) {
         if (options.signal?.aborted) break;
-        const hz = options.startHz + (span * i) / steps;
+        const hz = grid[i]!;
         await this.setFrequency(channel, hz);
-        if (options.dwellMs) await new Promise((r) => setTimeout(r, options.dwellMs));
+        for (let k = 0; i === 0 && k < settleReads && !options.signal?.aborted; k++) {
+          await dwell();
+          await this.readBiofeedback();
+        }
+        await dwell();
         const { current, phaseAngle } = await this.readBiofeedback();
         out.push({ current: current ?? 0, phaseAngle: phaseAngle ?? 0 });
         options.onSample?.({ hz, current, phaseAngle });
       }
       return out;
     };
-    const hzAt = (i: number) => options.startHz + (span * i) / steps;
     const subtract = (
       sums: Array<{ current: number; phaseAngle: number }>,
       baseline: Array<{ current: number; phaseAngle: number }> | null,
       divisor: number,
     ) =>
       sums.map((s, i) => ({
-        hz: hzAt(i),
+        hz: grid[i]!,
         current: s.current / divisor - (baseline?.[i]?.current ?? 0),
         phaseAngle: s.phaseAngle / divisor - (baseline?.[i]?.phaseAngle ?? 0),
       }));
@@ -712,12 +802,11 @@ export class GenXPro implements SignalGenerator {
         if (options.signal?.aborted) return subtract(baseline, null, 1);
       }
 
-      const sums = new Array<{ current: number; phaseAngle: number }>(steps + 1);
-      for (let i = 0; i <= steps; i++) sums[i] = { current: 0, phaseAngle: 0 };
+      const sums = grid.map(() => ({ current: 0, phaseAngle: 0 }));
       for (let loop = 0; loop < loops; loop++) {
         const pass = await sweep();
-        if (pass.length < steps + 1) return subtract(pass, baseline, 1);
-        for (let i = 0; i <= steps; i++) {
+        if (pass.length < grid.length) return subtract(pass, baseline, 1);
+        for (let i = 0; i < grid.length; i++) {
           sums[i]!.current += pass[i]!.current;
           sums[i]!.phaseAngle += pass[i]!.phaseAngle;
         }
@@ -725,10 +814,12 @@ export class GenXPro implements SignalGenerator {
       return subtract(sums, baseline, loops);
     } finally {
       if (options.stopOutputAtEnd ?? true) {
-        try {
-          await this.setOutput(channel, false);
-        } catch {
-          /* best effort */
+        for (const ch of driven) {
+          try {
+            await this.setOutput(ch, false);
+          } catch {
+            /* best effort */
+          }
         }
       }
     }
@@ -851,7 +942,9 @@ export class GenXPro implements SignalGenerator {
    * Confirmed present in the capture ("Port 3 - General Biofeedback").
    */
   async setDisplayText(text: string): Promise<void> {
-    await this.command(`:n00=${text}`);
+    // Truncated rather than rejected: the device drops a line of 60 characters
+    // or more outright, and this text is cosmetic.
+    await this.command(`:n00=${text.slice(0, OFFLINE_NAME_MAX)}`);
   }
 
   /**
@@ -895,11 +988,16 @@ export class GenXPro implements SignalGenerator {
       gate?: readonly number[];
     },
   ): Promise<void> {
-    if (!Number.isInteger(slot) || slot < 0) {
-      throw new AwgError(`program slot must be a non-negative integer, got ${slot}`);
+    const s = offlineSlot(slot);
+    if (program.name !== undefined) {
+      if (program.name.length > OFFLINE_NAME_MAX) {
+        throw new AwgError(
+          `program name must be at most ${OFFLINE_NAME_MAX} characters — the device's ` +
+            `parser drops a longer line — got ${program.name.length}`,
+        );
+      }
+      await this.command(`:n${s}=${program.name}`);
     }
-    const s = String(slot).padStart(2, "0");
-    if (program.name !== undefined) await this.command(`:n${s}=${program.name}`);
 
     const amp = Math.round(program.amplitudeVpp * GENX_AMPLITUDE_SCALE);
     const offset =
@@ -915,14 +1013,83 @@ export class GenXPro implements SignalGenerator {
       freqs.length,
       ...freqs,
     ].join(",");
-    await this.command(`:p${s}=${fields},`);
-
     // Two gate values per frequency (all-zero = no gating), per the capture.
+    // The gate table goes first: the device holds it in RAM and writes it to
+    // flash when the *next* `:p` arrives (`src/link.c:666-682`), so sending
+    // `:p` first would store this program with the previous slot's gate table.
     const gate = (program.gate ?? new Array(2 * freqs.length).fill(0)).join(",");
     await this.command(`:g${s}=${gate},`);
+    await this.command(`:p${s}=${fields},`);
+  }
 
-    // Spooky2 finalises a memory write with :w96=12321,
-    await this.commitOfflineMemory();
+  /** Read back a stored program's name (`:n<slot>=?`), or `null` if it has none. */
+  async readProgramName(slot: number): Promise<string | null> {
+    const reply = await this.command(`:n${offlineSlot(slot, 0)}=?`);
+    const m = /^:n\d\d=(.*)$/.exec(reply);
+    return m && m[1] !== "" ? m[1]! : null;
+  }
+
+  /**
+   * Read back a stored program (`:n<slot>=*`), or `null` for an empty slot.
+   *
+   * The device answers with the same `:p<slot>=` line that stores it, so the
+   * result can be handed straight back to {@link uploadProgram}.
+   */
+  async readProgram(slot: number): Promise<{
+    waveformSlot: number;
+    amplitudeVpp: number;
+    offsetRatio: number;
+    dwell: number;
+    frequenciesHz: number[];
+  } | null> {
+    const reply = await this.command(`:n${offlineSlot(slot)}=*`);
+    const values = offlineValues(reply, "p");
+    if (values === null || values.length < 5) return null;
+    const [waveformSlot, amp, offset, dwell, count] = values as [number, number, number, number, number];
+    return {
+      waveformSlot,
+      amplitudeVpp: amp / GENX_AMPLITUDE_SCALE,
+      offsetRatio: (offset - GENX_OFFSET_CENTRE) / GENX_OFFSET_SPAN,
+      dwell,
+      frequenciesHz: values.slice(5, 5 + count).map(decodeGenXFrequency),
+    };
+  }
+
+  /**
+   * Read back a slot's gate table (`:n<slot>=#`), or `null` if it has none.
+   *
+   * The device sends **200 of the 400** stored values — a quirk of the original
+   * firmware that the open reimplementation keeps on purpose.
+   */
+  async readGateTable(slot: number): Promise<number[] | null> {
+    return offlineValues(await this.command(`:n${offlineSlot(slot)}=#`), "g");
+  }
+
+  /** Erase one program slot (`:n<slot>=,`). The slot's name is kept. */
+  async eraseProgram(slot: number): Promise<void> {
+    await this.command(`:n${offlineSlot(slot)}=,`);
+  }
+
+  /**
+   * Read the display board's firmware revision (`:n00=$` → `:Rev201`).
+   *
+   * The one command the device answers even while the host-access gate is shut,
+   * so it doubles as a liveness check. Spooky2 sends it on every connect.
+   */
+  async readDisplayRevision(): Promise<string | null> {
+    const reply = await this.command(":n00=$");
+    const m = /^:(\w+)$/.exec(reply);
+    return m ? m[1]! : null;
+  }
+
+  /** Switch the display backlight on or off (`:w64=`). Not gated by authentication. */
+  async setBacklight(on: boolean): Promise<void> {
+    await this.writeOut(GENX_PRO_REGISTERS.backlight, on ? 18888881 : 10000001);
+  }
+
+  /** Clear this link's PC-mode display state — frequencies, names, sync (`:w97=12621,`). */
+  async resetPcDisplayState(): Promise<void> {
+    await this.writeOut(GENX_PRO_REGISTERS.pcDisplayReset, 12621);
   }
 
   /**
@@ -930,7 +1097,7 @@ export class GenXPro implements SignalGenerator {
    * `letter` is `n` (name), `p` (parameters) or `g` (gating).
    */
   async writeOfflineSlot(letter: "n" | "p" | "g", slot: number, value: string): Promise<void> {
-    const s = String(slot).padStart(2, "0");
+    const s = offlineSlot(slot, letter === "n" ? 0 : 1);
     await this.command(`:${letter}${s}=${value}`);
   }
 
@@ -995,7 +1162,8 @@ export class GenXPro implements SignalGenerator {
         amplitudeVpp,
         offsetRatio,
         dwell: program.dwell,
-        name: program.name,
+        // Preset names run long; the device drops a line of 60 characters or more.
+        name: program.name?.slice(0, OFFLINE_NAME_MAX),
         frequenciesHz: program.frequenciesHz,
       });
     }
@@ -1005,6 +1173,34 @@ export class GenXPro implements SignalGenerator {
   // ────────────────────────────────────────────────────────────────────────
   // Wire
   // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Wait a moment, then throw away anything the device has left in the input
+   * buffer, so the next command reads its own answer.
+   *
+   * Two things put a line there that no command asked for: the display's
+   * `:w91=0,` after the handshake, and a reply that missed its window. Either
+   * one puts every following reply out of step. {@link authenticate} calls this
+   * for the first; call it yourself after a timeout, or before starting a
+   * sequence whose replies you intend to trust.
+   */
+  async resync(waitMs = 50): Promise<void> {
+    if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+    await this.transport.flush();
+  }
+
+  /**
+   * Read a line the device sends without being asked, or `""` if none arrives.
+   *
+   * The display board speaks on its own: `:w92` makes it send a `:w91=0,` of
+   * its own about 20 ms later. Everything else in this driver is
+   * request/response, so that line is normally drained by {@link resync} — use
+   * this when you want to see it.
+   */
+  async readUnsolicited(timeoutMs = 200): Promise<string> {
+    const reply = await readReply(this.transport, timeoutMs);
+    return reply === null ? "" : reply.trim();
+  }
 
   /** Send a raw command and return the device's reply. */
   async raw(command: string): Promise<string> {
@@ -1064,6 +1260,45 @@ function assertFinite(name: string, value: number): void {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new AwgError(`${name} must be a finite number, got ${value}`);
   }
+}
+
+/**
+ * The longest name the device's line parser accepts: at 60 characters it drops
+ * the whole line (open-spooky2 `src/link.c:26,261-264`).
+ */
+const OFFLINE_NAME_MAX = 59;
+
+/**
+ * Validate an offline slot number and render it as the two digits the wire
+ * format needs. Programs live in slots 1–30; `:n` also has slot 0 (the display
+ * title, RAM only), so name-only commands pass `min = 0`.
+ */
+function offlineSlot(slot: number, min = 1): string {
+  if (!Number.isInteger(slot) || slot < min || slot > 30) {
+    throw new AwgError(`program slot must be an integer ${min}…30, got ${slot}`);
+  }
+  return String(slot).padStart(2, "0");
+}
+
+/** Values from a `:p<slot>=…` / `:g<slot>=…` dump, or `null` for an empty slot. */
+function offlineValues(reply: string, letter: "p" | "g"): number[] | null {
+  const m = new RegExp(`^:${letter}\\d\\d=(.*)$`).exec(reply);
+  if (!m) return null;
+  const values = m[1]!.split(",").filter((v) => v !== "").map(Number);
+  return values.length > 0 && values.every(Number.isFinite) ? values : null;
+}
+
+/**
+ * Frequencies from `startHz` towards `endHz`, each `percent` % from the last:
+ * `startHz × (1 + percent / 100)^k`, up to the last one inside the range.
+ */
+function percentGrid(startHz: number, endHz: number, percent: number): number[] {
+  if (!(percent > 0) || !(startHz > 0) || !(endHz > 0)) {
+    throw new AwgError("stepPercent needs a positive percentage and positive startHz and endHz");
+  }
+  const ratio = (1 + percent / 100) ** Math.sign(endHz - startHz);
+  const count = ratio === 1 ? 0 : Math.floor(Math.log(endHz / startHz) / Math.log(ratio) + 1e-9);
+  return Array.from({ length: count + 1 }, (_, k) => startHz * ratio ** k);
 }
 
 /** Clamp a waveform sample into the device's 10-bit range. */

@@ -106,3 +106,21 @@ export type {
   BiofeedbackCalibration,
   CalibratedBiofeedback,
 } from "./biofeedback.js";
+export { runConformance, compareReports, CONFORMANCE_GROUPS } from "./conformance.js";
+export {
+  decodeDmsLog,
+  captureExpectations,
+  loadCaptureExpectations,
+  mergeExpectations,
+  expectationKey,
+  replyShape,
+  replyCategory,
+  capturedCategories,
+} from "./capture.js";
+export type { CaptureLine, ReplyCategory } from "./capture.js";
+export type {
+  ConformanceCase,
+  ConformanceReport,
+  ConformanceDifference,
+  ConformanceOptions,
+} from "./conformance.js";
