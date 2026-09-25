@@ -22,6 +22,8 @@ import { SPOOKY2_DEVICES } from "./devices.js";
 import { resolvePresetChain, presetToProgram } from "./presets.js";
 import { runPresetRun } from "./run-preset.js";
 import { detectHits, toBfbCsv, toBfbFrequenciesCsv } from "./biofeedback.js";
+import { runConformance, compareReports, CONFORMANCE_GROUPS, type ConformanceReport, type ConformanceCase } from "./conformance.js";
+import { loadCaptureExpectations } from "./capture.js";
 
 const registry = new DeviceRegistry().registerAll(SPOOKY2_DEVICES);
 
@@ -65,6 +67,13 @@ const COMMAND_OPTIONS: Record<string, NonNullable<ParseArgsConfig["options"]>> =
     "program-name": { type: "string" },
     dwell: { type: "string" },
   },
+  conformance: {
+    captures: { type: "string" },
+    record: { type: "string" },
+    compare: { type: "string" },
+    slot: { type: "string", default: "30" },
+    groups: { type: "string" },
+  },
 };
 
 const USAGE = `Usage: spooky2 <command> [options]
@@ -83,6 +92,14 @@ Commands:
                              --device genx-pro --port <path> --start <Hz> --end <Hz>
                              --step <Hz> --loops <n> --amp <Vpp> --max-hits <n> --channel 1|2
                              --out <scan.csv>  --program-file <BFB_Frequencies.csv> --program-name <name>
+  conformance                Check a Gen X Pro against the display firmware's documented
+                             behaviour, to compare two firmwares (Gen X Pro only)
+                             --port <path> --record <baseline.json> --compare <baseline.json>
+                             --slot <1-30>  --captures <dir of .dmslog8 captures>
+                             --groups link,registers,programs,parser,handshake,
+                                      calibration,biofeedback,display
+                             Never erases program memory, writes calibration or resets;
+                             it borrows one slot and restores it.
 
 Global options:
   -d, --device <id>          Driver to use (see \`spooky2 devices\`)
@@ -280,6 +297,104 @@ function parseChannels(value: unknown): number[] | undefined {
   });
 }
 
+async function cmdConformance(values: ParsedCli["values"]): Promise<void> {
+  const path = values["port"] ? String(values["port"]) : undefined;
+  if (!path) {
+    throw new AwgError("--port is required — run `spooky2 list` to find it");
+  }
+  const deviceId = values["device"] ? String(values["device"]) : "genx-pro";
+  if (deviceId !== "genx-pro") {
+    throw new AwgError(`conformance is a Gen X Pro suite — --device ${deviceId} is not supported`);
+  }
+  const slot = parseNumber("slot", values["slot"]);
+  const known = CONFORMANCE_GROUPS as readonly ConformanceCase["group"][];
+  const groups = values["groups"]
+    ? String(values["groups"])
+        .split(",")
+        .map((g) => g.trim() as ConformanceCase["group"])
+    : undefined;
+  for (const g of groups ?? []) {
+    if (!known.includes(g)) throw new AwgError(`--groups: unknown group "${g}" — pick from ${known.join(", ")}`);
+  }
+
+  // Captures of the vendor software driving a real unit: the strongest
+  // statement of what an answer should look like.
+  let expectations: Awaited<ReturnType<typeof loadCaptureExpectations>>["expectations"] | undefined;
+  if (values["captures"]) {
+    const loaded = await loadCaptureExpectations(String(values["captures"]));
+    expectations = loaded.expectations;
+    if (!values["json"]) {
+      console.log(
+        `Expectations from ${loaded.files.length} capture(s) in ${values["captures"]}: ` +
+          `${expectations.size} commands the real device answered.`,
+      );
+    }
+  }
+
+  const device = registry.create(deviceId, new NodeSerialTransport(path), {
+    debug: values["debug"] === true,
+  }) as import("./genx-pro.js").GenXPro;
+  await device.open();
+
+  let report: ConformanceReport;
+  try {
+    let group = "";
+    report = await runConformance(device, {
+      slot,
+      ...(groups ? { groups } : {}),
+      ...(expectations ? { expectations } : {}),
+      onCase: (c) => {
+        if (values["json"]) return;
+        if (c.group !== group) {
+          group = c.group;
+          console.log(`\n${group}`);
+        }
+        const vendor = c.capture ? (c.capture.ok ? " ⟦capture ✔⟧" : " ⟦capture ✖⟧") : "";
+        console.log(`  ${c.ok ? "✔" : "✖"} ${c.id.padEnd(26)} ${c.ok ? c.description : c.detail}${vendor}`);
+      },
+    });
+  } finally {
+    await device.close();
+  }
+
+  const failed = report.cases.filter((c) => !c.ok);
+  let differences: ReturnType<typeof compareReports> = [];
+  if (values["compare"]) {
+    const baseline = JSON.parse(readFileSync(String(values["compare"]), "utf8")) as ConformanceReport;
+    differences = compareReports(baseline, report);
+  }
+
+  if (values["json"]) {
+    console.log(JSON.stringify({ report, differences }, null, 2));
+  } else {
+    const checked = report.cases.filter((c) => c.capture).length;
+    console.log(
+      `\n${report.cases.length - failed.length}/${report.cases.length} cases pass` +
+        ` (firmware ${report.device.firmware ?? "?"}, display ${report.device.revision ?? "?"})` +
+        (checked > 0 ? `, ${checked} also checked against the captures` : ""),
+    );
+    if (values["compare"]) {
+      console.log(
+        differences.length === 0
+          ? `No differences from ${values["compare"]}.`
+          : `\n${differences.length} difference(s) from ${values["compare"]}:`,
+      );
+      for (const d of differences) {
+        console.log(`  ✖ ${d.id} — ${d.description}`);
+        console.log(`      baseline: ${d.baseline ?? "(case absent)"}`);
+        console.log(`      current:  ${d.current ?? "(case absent)"}`);
+      }
+    }
+  }
+
+  if (values["record"]) {
+    writeFileSync(String(values["record"]), `${JSON.stringify(report, null, 2)}\n`);
+    if (!values["json"]) console.log(`\nBaseline written to ${values["record"]}`);
+  }
+
+  if (failed.length > 0 || differences.length > 0) process.exitCode = 1;
+}
+
 async function cmdScan(values: ParsedCli["values"]): Promise<void> {
   const deviceId = values["device"] ? String(values["device"]) : undefined;
   if (!deviceId) {
@@ -372,6 +487,8 @@ export async function run(argv: string[]): Promise<void> {
       return cmdRunPreset(values);
     case "scan":
       return cmdScan(values);
+    case "conformance":
+      return cmdConformance(values);
     default:
       throw new AwgError(`Unknown command "${command}"`);
   }
